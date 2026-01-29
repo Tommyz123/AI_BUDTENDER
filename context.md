@@ -1,4 +1,4 @@
-# 🗺️ AI Budtender 技术架构索引
+# 🗺️ AI Budtender Project Context
 
 > **目标读者**: AI 助手 (Claude/GPT) & 核心维护者
 > **用途**: 快速建立上下文，减少 Token 消耗，精准定位修改点。
