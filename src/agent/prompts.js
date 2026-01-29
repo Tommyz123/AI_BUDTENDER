@@ -23,6 +23,9 @@ Your goal is to help customers find the perfect product with genuine, helpful ad
 **RESPONSE FORMAT:**
 -   Keep it conversational and natural.
 -   When recommending products, present them clearly with helpful context about why they're a good fit.
+-   **Product display format** (include Brand from the company field):
+    - **[Product Name] | Brand: [Company] | [Category] | [Size if applicable]**
+    - Price, THC/CBD, Effects, Description
 `;
 
 module.exports = { SYSTEM_PROMPT };

@@ -1,7 +1,8 @@
 const path = require('path');
 
-// 1. Define mock BEFORE mocking
+// 1. Define mocks BEFORE mocking
 const mockCreate = jest.fn();
+const mockVectorSearch = jest.fn();
 
 // 2. Mock OpenAI
 jest.mock('openai', () => {
@@ -16,11 +17,17 @@ jest.mock('openai', () => {
     });
 });
 
-// 3. Require Modules
+// 3. Mock vector-store
+jest.mock('../src/utils/vector-store', () => ({
+    vectorSearch: mockVectorSearch,
+    initializeEmbeddings: jest.fn()
+}));
+
+// 4. Require Modules
 // Note: We are testing the integration, so we use REAL Agent, SmartSearch, and Repo.
-// But we need to ensure they pick up the MOCKED OpenAI.
+// But we need to ensure they pick up the MOCKED OpenAI and vector-store.
 const { Agent } = require('../src/agent/brain');
-const { initData } = require('../src/data/product-repository');
+const { initData, searchProducts } = require('../src/data/product-repository');
 
 const TEST_CSV_PATH = path.resolve(__dirname, '../data/NYE2.1.csv');
 
@@ -35,7 +42,6 @@ describe('Full Agent Integration', () => {
     beforeEach(() => {
         jest.clearAllMocks();
         agent = new Agent();
-        // Since Agent mocks are cleared, we don't need to re-instantiate if it's stateless, but it's safer.
     });
 
     test('Scenario: Exact Match Search', async () => {
@@ -75,7 +81,7 @@ describe('Full Agent Integration', () => {
         expect(mockCreate).toHaveBeenCalledTimes(2); // 1. Decide Tool, 2. Reply with Data
     });
 
-    test('Scenario: Fallback with Association', async () => {
+    test('Scenario: Fallback with Vector Search', async () => {
         // Mock 1: Agent -> Tool Call (smart_search 'Purple Haze')
         mockCreate.mockResolvedValueOnce({
             choices: [{
@@ -94,24 +100,14 @@ describe('Full Agent Integration', () => {
             }]
         });
 
-        // Mock 2: SmartSearch internal call -> OpenAI Association
-        // Be careful: SmartSearch creates its OWN OpenAI instance. 
-        // Because we mocked 'openai' module at the top, that instance also uses 'mockCreate'!
-        // So the NEXT call to mockCreate will be from INSIDE SmartSearch.
-        mockCreate.mockResolvedValueOnce({
-            choices: [{
-                message: {
-                    role: 'assistant',
-                    content: JSON.stringify({
-                        type: 'Sativa',
-                        effect: 'Energetic',
-                        reasoning: 'Purple Haze is energetic.'
-                    })
-                }
-            }]
-        });
+        // Mock 2: Vector search returns similar products
+        // (No LLM call needed now - vector search replaces it)
+        mockVectorSearch.mockResolvedValueOnce([
+            { id: 'test-1', name: 'Sour Diesel', type: 'Sativa', price: 20 },
+            { id: 'test-2', name: 'Green Crack', type: 'Sativa', price: 18 }
+        ]);
 
-        // Mock 3: Agent calls OpenAI with tool result (from SmartSearch fallback) -> Final Reply
+        // Mock 3: Agent calls OpenAI with tool result -> Final Reply
         mockCreate.mockResolvedValueOnce({
             choices: [{
                 message: {
@@ -124,11 +120,46 @@ describe('Full Agent Integration', () => {
         const result = await agent.processMessage("Purple Haze");
 
         expect(result.reply).toContain("Sour Diesel");
-        expect(mockCreate).toHaveBeenCalledTimes(3);
+        // Now only 2 OpenAI calls (no LLM for association)
+        expect(mockCreate).toHaveBeenCalledTimes(2);
+        // Vector search should have been called
+        expect(mockVectorSearch).toHaveBeenCalledWith('Purple Haze', 5);
+    });
 
-        // Verify middle call was for association
-        const associationCall = mockCreate.mock.calls[1][0];
-        // The user message in association call is the query 'Purple Haze'
-        expect(associationCall.messages[1].content).toBe('Purple Haze');
+    test('Scenario: Predefined Mapping (no vector search needed)', async () => {
+        // Mock 1: Agent -> Tool Call (smart_search 'help me sleep')
+        mockCreate.mockResolvedValueOnce({
+            choices: [{
+                message: {
+                    role: 'assistant',
+                    content: null,
+                    tool_calls: [{
+                        id: 'call_3',
+                        type: 'function',
+                        function: {
+                            name: 'smart_search',
+                            arguments: JSON.stringify({ query: 'help me sleep' })
+                        }
+                    }]
+                }
+            }]
+        });
+
+        // Mock 2: Agent calls OpenAI with tool result -> Final Reply
+        mockCreate.mockResolvedValueOnce({
+            choices: [{
+                message: {
+                    role: 'assistant',
+                    content: "For sleep, I recommend these Indica strains."
+                }
+            }]
+        });
+
+        const result = await agent.processMessage("help me sleep");
+
+        expect(result.reply).toContain("sleep");
+        expect(mockCreate).toHaveBeenCalledTimes(2);
+        // Vector search should NOT be called for predefined mappings
+        expect(mockVectorSearch).not.toHaveBeenCalled();
     });
 });

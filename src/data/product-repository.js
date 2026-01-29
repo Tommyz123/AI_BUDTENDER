@@ -2,9 +2,53 @@ const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse');
 const { cleanData } = require('./cleaner');
+const { LRUCache } = require('../utils/cache');
 
 let products = [];
 let isInitialized = false;
+
+// Indexes for O(1) lookup
+let indexById = new Map();
+let indexByType = new Map(); // type -> Set of product indices
+let indexByEffect = new Map(); // effect -> Set of product indices
+
+// Search results cache (500 entries, 10 minute TTL)
+const searchCache = new LRUCache({
+    maxSize: 500,
+    ttl: 10 * 60 * 1000 // 10 minutes
+});
+
+/**
+ * Build indexes for fast lookup
+ */
+function buildIndexes() {
+    indexById.clear();
+    indexByType.clear();
+    indexByEffect.clear();
+
+    products.forEach((product, idx) => {
+        // ID index
+        indexById.set(product.id, product);
+
+        // Type index
+        const typeLower = product.type.toLowerCase();
+        if (!indexByType.has(typeLower)) {
+            indexByType.set(typeLower, new Set());
+        }
+        indexByType.get(typeLower).add(idx);
+
+        // Effect index
+        product.effects.forEach(effect => {
+            const effectLower = effect.toLowerCase();
+            if (!indexByEffect.has(effectLower)) {
+                indexByEffect.set(effectLower, new Set());
+            }
+            indexByEffect.get(effectLower).add(idx);
+        });
+    });
+
+    console.log(`[DataLayer] Indexes built: ${indexById.size} products, ${indexByType.size} types, ${indexByEffect.size} effects`);
+}
 
 /**
  * Initialize the data layer by loading and cleaning the CSV.
@@ -32,10 +76,18 @@ async function initData(csvPath) {
             }
             products = cleanData(records);
             isInitialized = true;
+            buildIndexes();
             console.log(`[DataLayer] Loaded and cleaned ${products.length} products.`);
             resolve();
         });
     });
+}
+
+/**
+ * Generate cache key from search criteria
+ */
+function getCacheKey(criteria) {
+    return JSON.stringify(criteria, Object.keys(criteria).sort());
 }
 
 /**
@@ -46,15 +98,60 @@ async function initData(csvPath) {
 async function searchProducts(criteria = {}) {
     if (!isInitialized) await initData();
 
-    return products.filter(p => {
+    // Check cache first
+    const cacheKey = getCacheKey(criteria);
+    const cached = searchCache.get(cacheKey);
+    if (cached) {
+        console.log(`[DataLayer] Search cache hit`);
+        return cached;
+    }
+
+    let candidateIndices = null;
+
+    // Use indexes to narrow down candidates
+    if (criteria.type) {
+        const typeIndices = indexByType.get(criteria.type.toLowerCase());
+        if (typeIndices) {
+            candidateIndices = new Set(typeIndices);
+        } else {
+            // No products of this type
+            searchCache.set(cacheKey, []);
+            return [];
+        }
+    }
+
+    if (criteria.effect) {
+        const effectIndices = indexByEffect.get(criteria.effect.toLowerCase());
+        if (effectIndices) {
+            if (candidateIndices) {
+                // Intersection
+                candidateIndices = new Set(
+                    [...candidateIndices].filter(idx => effectIndices.has(idx))
+                );
+            } else {
+                candidateIndices = new Set(effectIndices);
+            }
+        } else {
+            // No products with this effect
+            searchCache.set(cacheKey, []);
+            return [];
+        }
+    }
+
+    // Get candidate products
+    let candidates;
+    if (candidateIndices) {
+        candidates = [...candidateIndices].map(idx => products[idx]);
+    } else {
+        candidates = products;
+    }
+
+    // Apply remaining filters
+    const results = candidates.filter(p => {
         let match = true;
 
         if (criteria.name) {
             match = match && p.name.toLowerCase().includes(criteria.name.toLowerCase());
-        }
-
-        if (criteria.type) {
-            match = match && p.type.toLowerCase() === criteria.type.toLowerCase();
         }
 
         if (criteria.minPrice !== undefined) {
@@ -65,25 +162,24 @@ async function searchProducts(criteria = {}) {
             match = match && p.price <= criteria.maxPrice;
         }
 
-        // Exact effect match (case insensitive)
-        if (criteria.effect) {
-            const effectLower = criteria.effect.toLowerCase();
-            const hasEffect = p.effects.some(e => e.toLowerCase() === effectLower);
-            match = match && hasEffect;
-        }
-
         return match;
     });
+
+    // Cache the results
+    searchCache.set(cacheKey, results);
+
+    return results;
 }
 
 /**
  * Get a product by ID.
- * @param {string} id 
+ * @param {string} id
  * @returns {Object|null}
  */
 async function getProductById(id) {
     if (!isInitialized) await initData();
-    return products.find(p => p.id === id) || null;
+    // O(1) lookup using index
+    return indexById.get(id) || null;
 }
 
 /**
@@ -94,9 +190,11 @@ async function getAllProducts() {
     return products;
 }
 
+// Export cache for testing
 module.exports = {
     initData,
     searchProducts,
     getProductById,
-    getAllProducts
+    getAllProducts,
+    searchCache
 };

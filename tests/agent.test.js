@@ -32,19 +32,28 @@ describe('Agent Brain', () => {
         agent = new Agent();
     });
 
-    test('should process simple message without tool calls', async () => {
+    test('should return local response for simple greetings (skip API)', async () => {
+        const result = await agent.processMessage("Hi");
+
+        // Should use local response, not call API
+        expect(result.reply).toMatch(/Hey|Hi|Hello/);
+        expect(result.history).toHaveLength(2); // user + assistant
+        expect(mockCreate).not.toHaveBeenCalled();
+    });
+
+    test('should process complex message with API call', async () => {
         mockCreate.mockResolvedValue({
             choices: [{
                 message: {
-                    content: "Hello! I am Fried Rice.",
+                    content: "I can help you find products!",
                     tool_calls: null
                 }
             }]
         });
 
-        const result = await agent.processMessage("Hi");
+        const result = await agent.processMessage("What products do you have?");
 
-        expect(result.reply).toBe("Hello! I am Fried Rice.");
+        expect(result.reply).toBe("I can help you find products!");
         expect(result.history).toHaveLength(2); // user + assistant
         expect(mockCreate).toHaveBeenCalledTimes(1);
     });

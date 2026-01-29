@@ -24,7 +24,14 @@ jest.mock('../src/tools/product-details', () => ({
 }));
 // Data init mock handled implicitly or we can mock it
 jest.mock('../src/data/product-repository', () => ({
-    initData: jest.fn().mockResolvedValue()
+    initData: jest.fn().mockResolvedValue(),
+    getAllProducts: jest.fn().mockResolvedValue([])
+}));
+
+// Mock vector-store to prevent initialization errors
+jest.mock('../src/utils/vector-store', () => ({
+    initializeEmbeddings: jest.fn().mockResolvedValue(),
+    vectorSearch: jest.fn()
 }));
 
 

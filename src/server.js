@@ -1,18 +1,34 @@
 require('dotenv').config();
 const express = require('express');
+const compression = require('compression');
 const path = require('path');
 const { Agent } = require('./agent/brain');
 const { getProductDetails } = require('./tools/product-details');
-const { initData } = require('./data/product-repository');
+const { initData, getAllProducts } = require('./data/product-repository');
+const { initializeEmbeddings } = require('./utils/vector-store');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 // Initialize dependencies
 const agent = new Agent();
-initData().catch(console.error);
+
+// Initialize data and vector store
+async function initializeServices() {
+    try {
+        await initData();
+        const products = await getAllProducts();
+        await initializeEmbeddings(products);
+        console.log('[Server] All services initialized');
+    } catch (error) {
+        console.error('[Server] Initialization error:', error);
+    }
+}
+
+initializeServices();
 
 // Middleware
+app.use(compression()); // gzip compression
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
 

@@ -2,3 +2,6 @@ node_modules/
 .env
 .DS_Store
 coverage/
+
+# Generated embeddings cache (regenerated on startup)
+data/embeddings.json
