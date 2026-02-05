@@ -1,3 +1,17 @@
+// Normalize known misspellings in CSV Feelings column
+const EFFECT_NORMALIZATION = {
+    'telaxed': 'Relaxed',
+    'sleep': 'Sleepy',
+    'talkatve': 'Talkative',
+    'n/a': null
+};
+
+function normalizeEffect(effect) {
+    const lower = effect.toLowerCase();
+    if (lower in EFFECT_NORMALIZATION) return EFFECT_NORMALIZATION[lower];
+    return effect;
+}
+
 /**
  * Cleans and transforms raw CSV records into Product objects.
  * @param {Array} rawRecords - Array of objects from CSV parser.
@@ -16,10 +30,10 @@ function cleanData(rawRecords) {
             const price = parseFloat(record['Price numeric']);
             const thc = parseFloat(record['THC level numeric']) || 0;
 
-            // Parse effects (split by comma and trim)
+            // Parse effects (split by comma, trim, normalize misspellings, filter nulls)
             let effects = [];
             if (record.Feelings && record.Feelings !== 'Not Specified') {
-                effects = record.Feelings.split(',').map(e => e.trim());
+                effects = record.Feelings.split(',').map(e => e.trim()).map(normalizeEffect).filter(e => e !== null);
             }
 
             // Parse type (Capitalize first letter)

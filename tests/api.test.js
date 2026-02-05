@@ -1,15 +1,19 @@
 const request = require('supertest');
-const app = require('../src/server');
+
+// Mock functions must be defined before jest.mock calls
+const mockProcessMessage = jest.fn().mockResolvedValue({
+    reply: "Mock Reply",
+    history: []
+});
+const mockProcessMessageStream = jest.fn();
 
 // Mock Agent
 jest.mock('../src/agent/brain', () => {
     return {
         Agent: jest.fn().mockImplementation(() => {
             return {
-                processMessage: jest.fn().mockResolvedValue({
-                    reply: "Mock Reply",
-                    history: []
-                })
+                processMessage: mockProcessMessage,
+                processMessageStream: mockProcessMessageStream
             };
         })
     };
@@ -34,6 +38,8 @@ jest.mock('../src/utils/vector-store', () => ({
     vectorSearch: jest.fn()
 }));
 
+// Require app AFTER all mocks are set up
+const app = require('../src/server');
 
 describe('Web Interface API', () => {
     // Tests for Chat Endpoint
@@ -66,6 +72,72 @@ describe('Web Interface API', () => {
         test('should return 404 for unknown product', async () => {
             const res = await request(app).get('/api/products/unknown');
             expect(res.statusCode).toEqual(404);
+        });
+    });
+
+    // Tests for Streaming Chat Endpoint
+    describe('POST /api/chat/stream', () => {
+        beforeEach(() => {
+            mockProcessMessageStream.mockReset();
+        });
+
+        test('should return 400 error in SSE format if message is missing', async () => {
+            const res = await request(app)
+                .post('/api/chat/stream')
+                .send({});
+
+            expect(res.statusCode).toEqual(200); // SSE always returns 200
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            expect(res.text).toContain('data: {"type":"error","content":"Message is required"}');
+        });
+
+        test('should stream events from processMessageStream', async () => {
+            // Create async generator mock
+            mockProcessMessageStream.mockImplementation(async function* () {
+                yield { type: 'content', content: 'Hello' };
+                yield { type: 'content', content: ' World' };
+                yield { type: 'done', history: [{ role: 'user', content: 'test' }] };
+            });
+
+            const res = await request(app)
+                .post('/api/chat/stream')
+                .send({ message: "Hello" });
+
+            expect(res.statusCode).toEqual(200);
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            expect(res.text).toContain('data: {"type":"content","content":"Hello"}');
+            expect(res.text).toContain('data: {"type":"content","content":" World"}');
+            expect(res.text).toContain('data: {"type":"done"');
+        });
+
+        test('should handle stream errors gracefully', async () => {
+            mockProcessMessageStream.mockImplementation(async function* () {
+                yield { type: 'content', content: 'Starting...' };
+                throw new Error('Stream error');
+            });
+
+            const res = await request(app)
+                .post('/api/chat/stream')
+                .send({ message: "Hello" });
+
+            expect(res.statusCode).toEqual(200);
+            expect(res.text).toContain('data: {"type":"error","content":"Internal Server Error"}');
+        });
+
+        test('should include status events for tool calls', async () => {
+            mockProcessMessageStream.mockImplementation(async function* () {
+                yield { type: 'status', content: '正在搜索产品...' };
+                yield { type: 'content', content: 'Found products!' };
+                yield { type: 'done', history: [] };
+            });
+
+            const res = await request(app)
+                .post('/api/chat/stream')
+                .send({ message: "find me something for sleep" });
+
+            expect(res.statusCode).toEqual(200);
+            expect(res.text).toContain('正在搜索产品...');
+            expect(res.text).toContain('Found products!');
         });
     });
 });

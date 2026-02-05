@@ -3,9 +3,13 @@ const { SYSTEM_PROMPT } = require('./prompts');
 const { smartSearch } = require('../tools/smart-search');
 const { getProductDetails } = require('../tools/product-details');
 
-const openai = new OpenAI({
+let openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY || 'mock-key',
 });
+
+function setOpenAIClient(client) {
+    openai = client;
+}
 
 // Maximum conversation history turns to keep (sliding window)
 const MAX_HISTORY_TURNS = 10;
@@ -102,6 +106,20 @@ const TOOLS_SCHEMA = [
                     budgetTarget: {
                         type: "number",
                         description: "Optional target budget in USD."
+                    },
+                    category: {
+                        type: "string",
+                        description: "Optional category filter. Valid: Flower / Pre-rolls / Edibles / Vaporizers / Drink / Tincture / Concentrates"
+                    },
+                    excludeEffects: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "Effects to EXCLUDE from results (e.g., ['Energetic', 'Anxious']). Use when user says 'no X' or 'not X' or 'without X'."
+                    },
+                    excludeCategories: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "Categories to EXCLUDE from results (e.g., ['Flower', 'Pre-rolls']). Use when user says 'I don't want to smoke' or 'no vaping'."
                     }
                 },
                 required: ["query"]
@@ -127,9 +145,189 @@ const TOOLS_SCHEMA = [
     }
 ];
 
+// Keywords to scan from history for context enhancement
+const CONTEXT_KEYWORDS = {
+    effects: ['sleep', 'sleepy', 'relaxed', 'relaxing', 'energetic', 'happy', 'creative',
+              'focused', 'talkative', 'euphoric', 'hungry', 'uplifted', 'calm', 'chill'],
+    types: ['indica', 'sativa', 'hybrid'],
+    categories: ['flower', 'preroll', 'pre-roll', 'edible', 'vape', 'vaporizer',
+                 'drink', 'tincture', 'concentrate']
+};
+
+/**
+ * Detect if a user message requires factual tool calls (no guessing allowed)
+ * @param {string} userMessage
+ * @returns {boolean}
+ */
+function requiresToolCall(userMessage) {
+    const patterns = [
+        /(?:what|tell|describe|show|list).*(taste|flavor|flavour|description|like)/i,
+        /how much|price|cost|\$/i,
+        /do you have|got any|carry|sell|available/i,
+        /most expensive|cheapest|priciest|highest|lowest|strongest|weakest/i,
+        /compare|versus|vs|better than/i,
+        /thc|cbd|cbn|potency|strength/i,
+        /what(?:'s| is).*(brand|company|size)/i,
+        /(?:list|show|give me).*(?:all|every)/i,
+        /(?:under|below).*(dollar|\$)/i
+    ];
+    return patterns.some(pattern => pattern.test(userMessage));
+}
+
+/**
+ * Scan recent user history messages and append relevant keywords to query
+ * that are not already present, to preserve context across turns.
+ */
+function enhanceQueryWithHistory(query, history) {
+    if (!history || history.length === 0) return query;
+
+    const queryLower = query.toLowerCase();
+    const recentUserMessages = history
+        .filter(m => m.role === 'user')
+        .slice(-3)
+        .map(m => m.content.toLowerCase());
+
+    const allKeywords = [...CONTEXT_KEYWORDS.effects, ...CONTEXT_KEYWORDS.types, ...CONTEXT_KEYWORDS.categories];
+    const toAppend = [];
+
+    for (const msg of recentUserMessages) {
+        for (const kw of allKeywords) {
+            // Only add if keyword is in history but NOT already in current query
+            if (new RegExp('\\b' + kw + '\\b').test(msg) && !new RegExp('\\b' + kw + '\\b').test(queryLower)) {
+                if (!toAppend.includes(kw)) {
+                    toAppend.push(kw);
+                }
+            }
+        }
+    }
+
+    if (toAppend.length > 0) {
+        console.log(`[Agent] enhanceQueryWithHistory: appending [${toAppend.join(', ')}] from history`);
+        return query + ' ' + toAppend.join(' ');
+    }
+    return query;
+}
+
 class Agent {
     constructor() {
         this.systemPrompt = SYSTEM_PROMPT;
+    }
+
+    /**
+     * Process a user message with streaming response.
+     * Yields events: { type: 'content'|'status'|'done'|'error', content?: string, history?: Array }
+     * @param {string} userMessage - The user's input.
+     * @param {Array} history - Conversational history [{role, content}].
+     * @yields {Object} Stream events
+     */
+    async *processMessageStream(userMessage, history = []) {
+        // 1. Simple message fast path (no streaming needed)
+        const simpleReply = getSimpleResponse(userMessage);
+        if (simpleReply) {
+            console.log(`[Agent] Simple message detected, returning local response`);
+            yield { type: 'content', content: simpleReply };
+            const newHistory = [
+                ...history,
+                { role: "user", content: userMessage },
+                { role: "assistant", content: simpleReply }
+            ];
+            yield { type: 'done', history: trimHistory(newHistory) };
+            return;
+        }
+
+        // Trim history before processing
+        const trimmedHistory = trimHistory(history);
+
+        // Prepare messages: System + History + New User Message
+        const messages = [
+            { role: "system", content: this.systemPrompt },
+            ...trimmedHistory,
+            { role: "user", content: userMessage }
+        ];
+
+        // 2. First API call (non-streaming to check for tool calls)
+        // Use tool_choice: "required" for factual queries to prevent hallucinations
+        const needsToolCall = requiresToolCall(userMessage);
+        let response = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: messages,
+            tools: TOOLS_SCHEMA,
+            tool_choice: needsToolCall ? "required" : "auto",
+        });
+
+        let message = response.choices[0].message;
+
+        // 3. Handle Tool Calls Loop
+        while (message.tool_calls) {
+            // Append assistant's intent to call tool to history
+            messages.push(message);
+
+            for (const toolCall of message.tool_calls) {
+                const fnName = toolCall.function.name;
+                const args = JSON.parse(toolCall.function.arguments);
+                let result = null;
+
+                console.log(`[Agent] Calling tool: ${fnName} with args:`, args);
+
+                // Yield status for user feedback
+                if (fnName === 'smart_search') {
+                    yield { type: 'status', content: '正在搜索产品...' };
+                } else if (fnName === 'get_product_details') {
+                    yield { type: 'status', content: '正在获取产品详情...' };
+                }
+
+                try {
+                    if (fnName === 'smart_search') {
+                        const enhancedQuery = enhanceQueryWithHistory(args.query, trimmedHistory);
+                        result = await smartSearch(enhancedQuery, {
+                            budgetTarget: args.budgetTarget,
+                            category: args.category,
+                            excludeEffects: args.excludeEffects || [],
+                            excludeCategories: args.excludeCategories || []
+                        });
+                    } else if (fnName === 'get_product_details') {
+                        result = await getProductDetails(args.productId);
+                    } else {
+                        result = { error: "Unknown tool" };
+                    }
+                } catch (err) {
+                    console.error(`[Agent] Tool execution failed:`, err);
+                    result = { error: "Tool execution failed" };
+                }
+
+                // Append tool result
+                messages.push({
+                    tool_call_id: toolCall.id,
+                    role: "tool",
+                    name: fnName,
+                    content: JSON.stringify(result)
+                });
+            }
+
+            // Call LLM again with tool results (non-streaming to check for more tool calls)
+            response = await openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: messages,
+                tools: TOOLS_SCHEMA
+            });
+
+            message = response.choices[0].message;
+        }
+
+        // 4. Final reply — message.content already contains the complete response
+        const fullContent = message.content || '';
+        if (fullContent) {
+            yield { type: 'content', content: fullContent };
+        }
+
+        // Update history
+        const newHistory = [
+            ...trimmedHistory,
+            { role: "user", content: userMessage },
+            { role: "assistant", content: fullContent }
+        ];
+
+        yield { type: 'done', history: trimHistory(newHistory) };
     }
 
     /**
@@ -165,11 +363,13 @@ class Agent {
         ];
 
         // First call to LLM
+        // Use tool_choice: "required" for factual queries to prevent hallucinations
+        const needsToolCall = requiresToolCall(userMessage);
         let response = await openai.chat.completions.create({
             model: "gpt-4o-mini",
             messages: messages,
             tools: TOOLS_SCHEMA,
-            tool_choice: "auto",
+            tool_choice: needsToolCall ? "required" : "auto",
         });
 
         let message = response.choices[0].message;
@@ -188,7 +388,13 @@ class Agent {
 
                 try {
                     if (fnName === 'smart_search') {
-                        result = await smartSearch(args.query, { budgetTarget: args.budgetTarget });
+                        const enhancedQuery = enhanceQueryWithHistory(args.query, trimmedHistory);
+                        result = await smartSearch(enhancedQuery, {
+                            budgetTarget: args.budgetTarget,
+                            category: args.category,
+                            excludeEffects: args.excludeEffects || [],
+                            excludeCategories: args.excludeCategories || []
+                        });
                     } else if (fnName === 'get_product_details') {
                         result = await getProductDetails(args.productId);
                     } else {
@@ -246,4 +452,4 @@ class Agent {
 }
 
 // Export for testing
-module.exports = { Agent, getSimpleResponse, trimHistory, MAX_HISTORY_TURNS, SIMPLE_RESPONSES };
+module.exports = { Agent, getSimpleResponse, trimHistory, MAX_HISTORY_TURNS, SIMPLE_RESPONSES, enhanceQueryWithHistory, setOpenAIClient, requiresToolCall };

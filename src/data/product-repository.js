@@ -11,6 +11,7 @@ let isInitialized = false;
 let indexById = new Map();
 let indexByType = new Map(); // type -> Set of product indices
 let indexByEffect = new Map(); // effect -> Set of product indices
+let indexByCategory = new Map(); // category -> Set of product indices
 
 // Search results cache (500 entries, 10 minute TTL)
 const searchCache = new LRUCache({
@@ -25,6 +26,7 @@ function buildIndexes() {
     indexById.clear();
     indexByType.clear();
     indexByEffect.clear();
+    indexByCategory.clear();
 
     products.forEach((product, idx) => {
         // ID index
@@ -45,9 +47,18 @@ function buildIndexes() {
             }
             indexByEffect.get(effectLower).add(idx);
         });
+
+        // Category index
+        if (product.category) {
+            const catLower = product.category.toLowerCase();
+            if (!indexByCategory.has(catLower)) {
+                indexByCategory.set(catLower, new Set());
+            }
+            indexByCategory.get(catLower).add(idx);
+        }
     });
 
-    console.log(`[DataLayer] Indexes built: ${indexById.size} products, ${indexByType.size} types, ${indexByEffect.size} effects`);
+    console.log(`[DataLayer] Indexes built: ${indexById.size} products, ${indexByType.size} types, ${indexByEffect.size} effects, ${indexByCategory.size} categories`);
 }
 
 /**
@@ -84,22 +95,32 @@ async function initData(csvPath) {
 }
 
 /**
- * Generate cache key from search criteria
+ * Generate cache key from search criteria and options
  */
-function getCacheKey(criteria) {
-    return JSON.stringify(criteria, Object.keys(criteria).sort());
+function getCacheKey(criteria, options = {}) {
+    // Create a stable stringification by sorting keys recursively
+    const sortedCriteria = Object.keys(criteria).sort().reduce((obj, key) => {
+        obj[key] = criteria[key];
+        return obj;
+    }, {});
+    const sortedOptions = Object.keys(options).sort().reduce((obj, key) => {
+        obj[key] = options[key];
+        return obj;
+    }, {});
+    return JSON.stringify({ criteria: sortedCriteria, options: sortedOptions });
 }
 
 /**
  * Search products by criteria.
  * @param {Object} criteria - { name, type, minPrice, maxPrice, effect }
+ * @param {Object} options - { sortBy, sortOrder, limit }
  * @returns {Array} Filtered products
  */
-async function searchProducts(criteria = {}) {
+async function searchProducts(criteria = {}, options = {}) {
     if (!isInitialized) await initData();
 
     // Check cache first
-    const cacheKey = getCacheKey(criteria);
+    const cacheKey = getCacheKey(criteria, options);
     const cached = searchCache.get(cacheKey);
     if (cached) {
         console.log(`[DataLayer] Search cache hit`);
@@ -138,6 +159,22 @@ async function searchProducts(criteria = {}) {
         }
     }
 
+    if (criteria.category) {
+        const catIndices = indexByCategory.get(criteria.category.toLowerCase());
+        if (catIndices) {
+            if (candidateIndices) {
+                candidateIndices = new Set(
+                    [...candidateIndices].filter(idx => catIndices.has(idx))
+                );
+            } else {
+                candidateIndices = new Set(catIndices);
+            }
+        } else {
+            searchCache.set(cacheKey, []);
+            return [];
+        }
+    }
+
     // Get candidate products
     let candidates;
     if (candidateIndices) {
@@ -147,7 +184,7 @@ async function searchProducts(criteria = {}) {
     }
 
     // Apply remaining filters
-    const results = candidates.filter(p => {
+    let results = candidates.filter(p => {
         let match = true;
 
         if (criteria.name) {
@@ -159,13 +196,39 @@ async function searchProducts(criteria = {}) {
         }
 
         if (criteria.maxPrice !== undefined) {
-            match = match && p.price <= criteria.maxPrice;
+            const isStrict = criteria.maxPriceExclusive === true;
+            match = match && (isStrict ? p.price < criteria.maxPrice : p.price <= criteria.maxPrice);
         }
 
         return match;
     });
 
-    // Cache the results
+    // Apply sorting if requested
+    if (options.sortBy) {
+        results.sort((a, b) => {
+            let aVal = a[options.sortBy];
+            let bVal = b[options.sortBy];
+
+            // Handle numeric fields
+            if (options.sortBy === 'thc' || options.sortBy === 'cbd') {
+                aVal = parseFloat(aVal) || 0;
+                bVal = parseFloat(bVal) || 0;
+            } else if (options.sortBy === 'price') {
+                aVal = parseFloat(aVal) || 0;
+                bVal = parseFloat(bVal) || 0;
+            }
+
+            const comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+            return options.sortOrder === 'desc' ? -comparison : comparison;
+        });
+    }
+
+    // Apply limit if requested
+    if (options.limit) {
+        results = results.slice(0, options.limit);
+    }
+
+    // Cache the results (use the same key generated at the start)
     searchCache.set(cacheKey, results);
 
     return results;

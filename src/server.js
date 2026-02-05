@@ -34,7 +34,7 @@ app.use(express.static(path.join(__dirname, '../public')));
 
 // API Routes
 
-// Chat Endpoint
+// Chat Endpoint (non-streaming, kept for backwards compatibility)
 app.post('/api/chat', async (req, res) => {
     try {
         const { message, history } = req.body;
@@ -49,6 +49,34 @@ app.post('/api/chat', async (req, res) => {
         console.error('Chat API Error:', error);
         res.status(500).json({ error: 'Internal Server Error' });
     }
+});
+
+// Streaming Chat Endpoint (SSE)
+app.post('/api/chat/stream', async (req, res) => {
+    // Set SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+
+    const { message, history } = req.body;
+
+    if (!message) {
+        res.write(`data: ${JSON.stringify({ type: 'error', content: 'Message is required' })}\n\n`);
+        res.end();
+        return;
+    }
+
+    try {
+        for await (const event of agent.processMessageStream(message, history || [])) {
+            res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+    } catch (error) {
+        console.error('Stream API Error:', error);
+        res.write(`data: ${JSON.stringify({ type: 'error', content: 'Internal Server Error' })}\n\n`);
+    }
+
+    res.end();
 });
 
 // Product Details Endpoint
